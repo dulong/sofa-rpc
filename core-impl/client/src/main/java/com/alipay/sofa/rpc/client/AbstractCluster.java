@@ -32,6 +32,9 @@ import com.alipay.sofa.rpc.core.exception.SofaRpcRuntimeException;
 import com.alipay.sofa.rpc.core.invoke.SofaResponseCallback;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
 import com.alipay.sofa.rpc.core.response.SofaResponse;
+import com.alipay.sofa.rpc.dynamic.DynamicConfigKeys;
+import com.alipay.sofa.rpc.dynamic.DynamicConfigManager;
+import com.alipay.sofa.rpc.dynamic.DynamicConfigManagerFactory;
 import com.alipay.sofa.rpc.event.EventBus;
 import com.alipay.sofa.rpc.event.ProviderInfoAddEvent;
 import com.alipay.sofa.rpc.event.ProviderInfoRemoveEvent;
@@ -352,10 +355,12 @@ public abstract class AbstractCluster extends Cluster {
         List<ProviderInfo> providerInfos = routerChain.route(message, null);
 
         //保存一下原始地址,为了打印
-        List<ProviderInfo> orginalProviderInfos = new ArrayList<ProviderInfo>(providerInfos);
+        List<ProviderInfo> orginalProviderInfos;
 
         if (CommonUtils.isEmpty(providerInfos)) {
             throw noAvailableProviderException(message.getTargetServiceUniqueName());
+        } else {
+            orginalProviderInfos = new ArrayList<ProviderInfo>(providerInfos);
         }
         if (CommonUtils.isNotEmpty(invokedProviderInfos) && providerInfos.size() > invokedProviderInfos.size()) { // 总数大于已调用数
             providerInfos.removeAll(invokedProviderInfos);// 已经调用异常的本次不再重试
@@ -587,6 +592,24 @@ public abstract class AbstractCluster extends Cluster {
      * @return 调用超时
      */
     private int resolveTimeout(SofaRequest request, ConsumerConfig consumerConfig, ProviderInfo providerInfo) {
+        // 动态配置优先
+        final String dynamicAlias = consumerConfig.getParameter(DynamicConfigKeys.DYNAMIC_ALIAS);
+        if (StringUtils.isNotBlank(dynamicAlias)) {
+            String dynamicTimeout = null;
+            DynamicConfigManager dynamicConfigManager = DynamicConfigManagerFactory.getDynamicManager(
+                consumerConfig.getAppName(),
+                dynamicAlias);
+
+            if (dynamicConfigManager != null) {
+                dynamicTimeout = dynamicConfigManager.getConsumerMethodProperty(request.getInterfaceName(),
+                    request.getMethodName(),
+                    "timeout");
+            }
+
+            if (StringUtils.isNotBlank(dynamicTimeout)) {
+                return Integer.parseInt(dynamicTimeout);
+            }
+        }
         // 先去调用级别配置
         Integer timeout = request.getTimeout();
         if (timeout == null) {
