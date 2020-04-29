@@ -21,24 +21,14 @@ import com.alipay.sofa.rpc.core.exception.RpcErrorType;
 import com.alipay.sofa.rpc.core.exception.SofaRpcException;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
 import com.alipay.sofa.rpc.core.response.SofaResponse;
-
-import io.grpc.CallOptions;
-import io.grpc.Channel;
-import io.grpc.ClientCall;
-import io.grpc.MethodDescriptor;
-import io.grpc.MethodDescriptor.MethodType;
-import io.grpc.stub.ClientCalls;
-import io.grpc.stub.StreamObserver;
-
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
-import java.util.concurrent.TimeUnit;
-
-import com.alibaba.fastjson.JSONArray;
-import com.alibaba.fastjson.JSONObject;
-
 import com.alipay.sofa.rpc.log.Logger;
 import com.alipay.sofa.rpc.log.LoggerFactory;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.stub.StreamObserver;
+
+import java.lang.reflect.Method;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Invoker for Grpc
@@ -67,9 +57,9 @@ public class GrpcClientInvoker {
 
     /**
      * The constructor
+     *
      * @param sofaRequest The SofaRequest
-     * @param methodDescriptor The MethodDescriptor
-     * @param channel The Channel
+     * @param channel     The Channel
      */
     public GrpcClientInvoker(SofaRequest sofaRequest, Channel channel) {
         this.channel = channel;
@@ -85,30 +75,20 @@ public class GrpcClientInvoker {
         try {
             requestClass.cast(request);
         } catch (ClassCastException e) {
-            //TODO: handle exception
-            LOGGER.error("Request type error!");
             throw e;
         }
-
-        // if (request instanceof String ) {
-        //     Object realRequest = makeRequestFromString((String)request);
-        // }
         this.timeout = sofaRequest.getTimeout();
     }
 
-    public Object makeRequestFromString(String in) {
-        int end = in.lastIndexOf('}');
-        int begine = in.indexOf('{');
-        String trimmed = in.substring(begine, end + 1);
-        JSONObject jObject = JSONObject.parseObject(trimmed);
-        return new Object();
-    }
-
     public SofaResponse invoke() {
-        Object response = invokeRequestMethod();
-        SofaResponse r = new SofaResponse();
-        r.setAppResponse(response);
-        return r;
+        SofaResponse sofaResponse = new SofaResponse();
+        try {
+            Object response = invokeRequestMethod();
+            sofaResponse.setAppResponse(response);
+        } catch (SofaRpcException e) {
+            sofaResponse.setErrorMsg(e.getMessage());
+        }
+        return sofaResponse;
     }
 
     private CallOptions buildCallOptions() {
@@ -127,20 +107,8 @@ public class GrpcClientInvoker {
             newBlockingStubMethod.setAccessible(true);
             stub = (io.grpc.stub.AbstractStub) newBlockingStubMethod.invoke(null, channel);
 
-        } catch (ClassNotFoundException e) {
-            LOGGER.error("ClassNotFoundException");
-
-        } catch (IllegalAccessException e) {
-            LOGGER.error("IllegalAccessException");
-
-        } catch (NoSuchMethodException e) {
-            LOGGER.error("NoSuchMethodException");
-
-        } catch (InvocationTargetException e) {
-            LOGGER.error("InvocationTargetException");
-
-        } catch (IllegalArgumentException e) {
-            LOGGER.error("IllegalArgumentException");
+        } catch (Throwable e) {
+            throw new SofaRpcException(RpcErrorType.UNKNOWN, e.getMessage(), e);
         }
         return stub;
     }
@@ -153,20 +121,8 @@ public class GrpcClientInvoker {
             requestMethod.setAccessible(true);
             r = requestMethod.invoke(getBlockingStub(), methodArgs[0]);
 
-        } catch (ClassNotFoundException e) {
-            LOGGER.error("ClassNotFoundException");
-
-        } catch (IllegalAccessException e) {
-            LOGGER.error("IllegalAccessException");
-
-        } catch (NoSuchMethodException e) {
-            LOGGER.error("NoSuchMethodException");
-
-        } catch (InvocationTargetException e) {
-            LOGGER.error("InvocationTargetException");
-
-        } catch (IllegalArgumentException e) {
-            LOGGER.error("IllegalArgumentException");
+        } catch (Throwable e) {
+            throw new SofaRpcException(RpcErrorType.CLIENT_UNDECLARED_ERROR, e.getMessage(), e);
         }
         return r;
     }
