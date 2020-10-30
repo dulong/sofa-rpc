@@ -16,26 +16,28 @@
  */
 package com.alipay.sofa.rpc.common;
 
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
- *
- * @author <a href=mailto:zhanggeng.zg@antfin.com>GengZhang</a>
- * @since 5.1.0
- * //FIXME 每次发布修改
+ * @author zhaowang
+ * @version : MetadataHolder.java, v 0.1 2020年09月09日 4:09 下午 zhaowang Exp $
  */
-public final class Version {
+public class MetadataHolder {
+    static final ThreadLocal<Map<String,String>> localContext = new ThreadLocal<>();
 
-    /**
-     * 当前RPC版本，例如：5.6.7
-     */
-    public static final String VERSION       = "5.7.6";
+    public static Map<String, String> getMetaHolder() {
+        Map<String, String> stringStringMap = localContext.get();
+        if(stringStringMap == null){
+            LinkedHashMap<String, String> value = new LinkedHashMap<>();
+            localContext.set(value);
+            return value;
+        }
+        return stringStringMap;
+    }
 
-    /**
-     * 当前RPC版本，例如： 5.6.7 对应 50607
-     */
-    public static final int    RPC_VERSION   = 50706;
-
-    /**
-     * 当前Build版本，每次发布修改
-     */
-    public static final String BUILD_VERSION = "5.7.6_20200908155956";
+    public static void clear(){
+        localContext.remove();
+    }
 }

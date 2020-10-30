@@ -17,9 +17,12 @@
 package com.alipay.sofa.rpc.server.triple;
 
 import com.alipay.sofa.rpc.common.struct.NamedThreadFactory;
+import com.alipay.sofa.rpc.common.utils.StringUtils;
 import com.alipay.sofa.rpc.config.ProviderConfig;
 import com.alipay.sofa.rpc.config.ServerConfig;
 import com.alipay.sofa.rpc.core.exception.SofaRpcRuntimeException;
+import com.alipay.sofa.rpc.event.EventBus;
+import com.alipay.sofa.rpc.event.ServerStartedEvent;
 import com.alipay.sofa.rpc.ext.Extension;
 import com.alipay.sofa.rpc.interceptor.ServerReqHeaderInterceptor;
 import com.alipay.sofa.rpc.interceptor.TripleServerInterceptor;
@@ -27,6 +30,7 @@ import com.alipay.sofa.rpc.invoke.Invoker;
 import com.alipay.sofa.rpc.log.LogCodes;
 import com.alipay.sofa.rpc.log.Logger;
 import com.alipay.sofa.rpc.log.LoggerFactory;
+import com.alipay.sofa.rpc.proxy.ProxyFactory;
 import com.alipay.sofa.rpc.server.BusinessPool;
 import com.alipay.sofa.rpc.server.Server;
 import com.alipay.sofa.rpc.server.SofaRejectedExecutionHandler;
@@ -47,16 +51,21 @@ import io.grpc.netty.shaded.io.netty.channel.nio.NioEventLoopGroup;
 import io.grpc.netty.shaded.io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.grpc.protobuf.ProtoUtils;
 import io.grpc.util.MutableHandlerRegistry;
+import org.omg.PortableServer.ThreadPolicy;
 import triple.Request;
 import triple.Response;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static com.alipay.sofa.rpc.constant.TripleConstant.EXPOSE_OLD_UNIQUE_ID_SERVICE;
+import static com.alipay.sofa.rpc.constant.TripleConstant.TRIPLE_EXPOSE_OLD;
+import static com.alipay.sofa.rpc.utils.SofaProtoUtils.getFullNameWithUniqueId;
 import static io.grpc.MethodDescriptor.generateFullMethodName;
 
 /**
@@ -73,6 +82,12 @@ public class TripleServer implements Server {
      */
     private static final Logger                                          LOGGER          = LoggerFactory
                                                                                              .getLogger(TripleServer.class);
+    /**
+    * The mapping relationship between BindableService and ServerServiceDefinition
+    */
+    protected ConcurrentHashMap<ProviderConfig, ServerServiceDefinition> oldServiceInfo  = new ConcurrentHashMap<ProviderConfig,
+                                                                                                 ServerServiceDefinition>();
+
     /**
      * server config
      */
@@ -104,14 +119,21 @@ public class TripleServer implements Server {
      */
     protected AtomicInteger                                              invokerCnt      = new AtomicInteger();
 
+    /**
+     * Thread pool
+     * @param serverConfig ServerConfig
+     */
+    private ThreadPoolExecutor                                           bizThreadPool;
+
     @Override
     public void init(ServerConfig serverConfig) {
         this.serverConfig = serverConfig;
+        bizThreadPool = initThreadPool(serverConfig);
         server = NettyServerBuilder.forPort(serverConfig.getPort()).
             fallbackHandlerRegistry(handlerRegistry)
             .bossEventLoopGroup(constructBossEventLoopGroup())
             .workerEventLoopGroup(constructWorkerEventLoopGroup())
-            .executor(initThreadPool(serverConfig))
+            .executor(bizThreadPool)
             .channelType(constructChannel())
             .build();
     }
@@ -166,10 +188,16 @@ public class TripleServer implements Server {
             return;
         }
         synchronized (this) {
+            if (started) {
+                return;
+            }
             try {
                 server.start();
                 if (LOGGER.isInfoEnabled()) {
                     LOGGER.info("Start the triple server at port {}", serverConfig.getPort());
+                }
+                if (EventBus.isEnable(ServerStartedEvent.class)) {
+                    EventBus.post(new ServerStartedEvent(serverConfig, bizThreadPool));
                 }
             } catch (SofaRpcRuntimeException e) {
                 throw e;
@@ -212,30 +240,89 @@ public class TripleServer implements Server {
     public void registerProcessor(ProviderConfig providerConfig, Invoker instance) {
         Object ref = providerConfig.getRef();
         try {
-            final ServerServiceDefinition serviceDef;
+            ServerServiceDefinition serviceDef;
+
             if (SofaProtoUtils.isProtoClass(ref)) {
                 BindableService bindableService = (BindableService) providerConfig.getRef();
                 serviceDef = bindableService.bindService();
 
             } else {
-                GenericServiceImpl genericService = new GenericServiceImpl(providerConfig);
-                serviceDef = buildSofaServiceDef(genericService, providerConfig, instance);
+                Object obj = ProxyFactory.buildProxy(providerConfig.getProxy(), providerConfig.getProxyClass(),
+                    instance);
+                GenericServiceImpl genericService = new GenericServiceImpl(obj, providerConfig.getProxyClass());
+                genericService.setProxiedImpl(genericService);
+                serviceDef = buildSofaServiceDef(genericService, providerConfig);
             }
+            ServerServiceDefinition oldServiceDef;
+            oldServiceDef = serviceDef;
+            if (StringUtils.isNotBlank(providerConfig.getUniqueId())) {
+                serviceDef = appendUniqueIdToServiceDef(providerConfig.getUniqueId(), serviceDef);
+                if (exposeOldUniqueIdService(providerConfig)) {
+                    List<TripleServerInterceptor> interceptorList = buildInterceptorChain(oldServiceDef);
+                    ServerServiceDefinition serviceDefinition = ServerInterceptors.intercept(
+                        oldServiceDef, interceptorList);
+                    oldServiceInfo.put(providerConfig, serviceDefinition);
+                    ServerServiceDefinition ssd = handlerRegistry.addService(serviceDefinition);
+                    if (ssd != null) {
+                        throw new IllegalStateException("Can not expose service with same name:" +
+                            serviceDefinition.getServiceDescriptor().getName());
+                    }
+                }
+            }
+
             List<TripleServerInterceptor> interceptorList = buildInterceptorChain(serviceDef);
             ServerServiceDefinition serviceDefinition = ServerInterceptors.intercept(
                 serviceDef, interceptorList);
             serviceInfo.put(providerConfig, serviceDefinition);
-            handlerRegistry.addService(serviceDefinition);
+            ServerServiceDefinition ssd = handlerRegistry.addService(serviceDefinition);
+            if (ssd != null) {
+                throw new IllegalStateException("Can not expose service with same name:" +
+                    serviceDefinition.getServiceDescriptor().getName());
+            }
             invokerCnt.incrementAndGet();
         } catch (Exception e) {
-            LOGGER.error("Register triple service error", e);
+            String msg = "Register triple service error";
+            LOGGER.error(msg, e);
             serviceInfo.remove(providerConfig);
+            throw new SofaRpcRuntimeException(msg, e);
         }
 
     }
 
+    private boolean exposeOldUniqueIdService(ProviderConfig providerConfig) {
+        //default false
+        String exposeOld = providerConfig.getParameter(TRIPLE_EXPOSE_OLD);
+        if (StringUtils.isBlank(exposeOld)) {
+            return EXPOSE_OLD_UNIQUE_ID_SERVICE;
+        } else {
+            return Boolean.parseBoolean(exposeOld);
+        }
+    }
+
+    private ServerServiceDefinition appendUniqueIdToServiceDef(String uniqueId, ServerServiceDefinition serviceDef) {
+        final String newServiceName = serviceDef.getServiceDescriptor().getName() + "." + uniqueId;
+
+        ServerServiceDefinition.Builder builder = ServerServiceDefinition.builder(newServiceName);
+
+        Collection<ServerMethodDefinition<?, ?>> methods = serviceDef.getMethods();
+        for (ServerMethodDefinition method : methods) {
+            MethodDescriptor<?, ?> methodDescriptor = method.getMethodDescriptor();
+            String fullMethodName = methodDescriptor.getFullMethodName();
+            MethodDescriptor<?, ?> methodDescriptorWithUniqueId = methodDescriptor
+                .toBuilder()
+                .setFullMethodName(
+                    getFullNameWithUniqueId(fullMethodName, uniqueId))
+                .build();
+            ServerMethodDefinition<?, ?> newServerMethodDefinition = ServerMethodDefinition.create(
+                methodDescriptorWithUniqueId, method.getServerCallHandler());
+            builder.addMethod(newServerMethodDefinition);
+        }
+        serviceDef = builder.build();
+        return serviceDef;
+    }
+
     private ServerServiceDefinition buildSofaServiceDef(GenericServiceImpl genericService,
-                                                        ProviderConfig providerConfig, Invoker instance) {
+                                                        ProviderConfig providerConfig) {
         ServerServiceDefinition templateDefinition = genericService.bindService();
         ServerCallHandler<Request, Response> templateHandler = (ServerCallHandler<Request, Response>) templateDefinition
             .getMethods().iterator().next().getServerCallHandler();
@@ -310,6 +397,12 @@ public class TripleServer implements Server {
     public void unRegisterProcessor(ProviderConfig providerConfig, boolean closeIfNoEntry) {
         try {
             ServerServiceDefinition serverServiceDefinition = serviceInfo.get(providerConfig);
+            if (exposeOldUniqueIdService(providerConfig)) {
+                ServerServiceDefinition oldServiceDef = oldServiceInfo.get(providerConfig);
+                if (oldServiceDef != null) {
+                    handlerRegistry.removeService(oldServiceDef);
+                }
+            }
             handlerRegistry.removeService(serverServiceDefinition);
             invokerCnt.decrementAndGet();
         } catch (Exception e) {
@@ -336,4 +429,14 @@ public class TripleServer implements Server {
             hook.postDestroy();
         }
     }
+
+    /**
+     * 得到业务线程池
+     *
+     * @return 业务线程池
+     */
+    public ThreadPoolExecutor getBizThreadPool() {
+        return bizThreadPool;
+    }
+
 }
